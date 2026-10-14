@@ -24,10 +24,17 @@ use Illuminate\Support\Carbon;
  * @property int $min_full_raise
  * @property int|null $last_aggressor_user_id
  * @property int $total_pot
- * @property array|null $pot_layers
+ * @property array<int, mixed>|null $pot_layers
  * @property int $elapsed_seconds
  * @property Carbon|null $started_at
  * @property Carbon|null $completed_at
+ * @property string|null $settlement_key
+ * @property Carbon|null $turn_started_at
+ * @property Carbon|null $turn_deadline_at
+ * @property bool $turn_extended
+ * @property string|null $cancel_reason
+ * @property int|null $cancelled_by_user_id
+ * @property string|null $cancel_key
  * @property Carbon|null $created_at
  * @property Carbon|null $updated_at
  */
@@ -85,6 +92,13 @@ class PokerHand extends Model
         'started_at',
         'completed_at',
         'idempotency_key',
+        'settlement_key',
+        'turn_started_at',
+        'turn_deadline_at',
+        'turn_extended',
+        'cancel_reason',
+        'cancelled_by_user_id',
+        'cancel_key',
     ];
 
     /**
@@ -102,6 +116,9 @@ class PokerHand extends Model
             'elapsed_seconds' => 'integer',
             'started_at' => 'datetime',
             'completed_at' => 'datetime',
+            'turn_started_at' => 'datetime',
+            'turn_deadline_at' => 'datetime',
+            'turn_extended' => 'boolean',
         ];
     }
 

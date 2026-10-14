@@ -5,7 +5,6 @@ namespace App\Actions\Chips;
 use App\Actions\Chips\Exceptions\IdempotencyConflictException;
 use App\Actions\Chips\Exceptions\InsufficientBalanceException;
 use App\Actions\Chips\Exceptions\InvalidTransferAmountException;
-use App\Actions\Chips\Exceptions\RecipientIneligibleException;
 use App\Actions\Chips\Exceptions\RecipientNotFoundException;
 use App\Actions\Chips\Exceptions\SelfTransferException;
 use App\Events\ChipBalanceUpdated;
@@ -28,7 +27,6 @@ class TransferChips
      * @throws InvalidTransferAmountException
      * @throws RecipientNotFoundException
      * @throws SelfTransferException
-     * @throws RecipientIneligibleException
      * @throws InsufficientBalanceException
      * @throws IdempotencyConflictException
      */
@@ -62,10 +60,6 @@ class TransferChips
 
         if ($recipient->id === $sender->id) {
             throw new SelfTransferException('Cannot transfer chips to yourself.');
-        }
-
-        if (! $recipient->hasVerifiedEmail()) {
-            throw new RecipientIneligibleException('Recipient account is not eligible to receive chips.');
         }
 
         $recipientWallet = $this->ensureWallet($recipient);

@@ -24,7 +24,7 @@ return new class extends Migration
             $table->foreignId('current_turn_user_id')->nullable()->constrained('users')->nullOnDelete();
             $table->unsignedBigInteger('current_bet')->default(0);
             $table->unsignedBigInteger('min_full_raise')->default(0);
-            $table->unsignedBigInteger('last_aggressor_user_id')->nullable()->constrained('users')->nullOnDelete();
+            $table->foreignId('last_aggressor_user_id')->nullable()->constrained('users')->nullOnDelete();
             $table->unsignedBigInteger('total_pot')->default(0);
             $table->json('pot_layers')->nullable(); // computed on settlement
             $table->unsignedSmallInteger('elapsed_seconds')->default(0);

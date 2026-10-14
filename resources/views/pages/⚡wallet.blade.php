@@ -7,11 +7,13 @@ use App\Actions\Chips\Exceptions\RecipientIneligibleException;
 use App\Actions\Chips\Exceptions\RecipientNotFoundException;
 use App\Actions\Chips\Exceptions\SelfTransferException;
 use App\Actions\Chips\TransferChips;
+use App\Actions\Chips\Exceptions\ChipTransferException;
 use App\Models\ChipTransaction;
 use App\Models\User;
 use App\Models\Wallet;
 use Flux\Flux;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Facades\RateLimiter;
 use Illuminate\Support\Str;
 use Livewire\Attributes\Computed;
@@ -141,17 +143,17 @@ new #[Title('Wallet')] class extends Component
             );
         } catch (SelfTransferException|RecipientNotFoundException|RecipientIneligibleException $e) {
             $this->confirming = false;
-            $this->addError('recipientUsername', __($e->getMessage()));
+            $this->addError('recipientUsername', $this->safeError($e));
 
             return;
         } catch (InsufficientBalanceException|InvalidTransferAmountException $e) {
             $this->confirming = false;
-            $this->addError('amount', __($e->getMessage()));
+            $this->addError('amount', $this->safeError($e));
 
             return;
         } catch (IdempotencyConflictException $e) {
             $this->confirming = false;
-            $this->addError('amount', __($e->getMessage()));
+            $this->addError('amount', $this->safeError($e));
 
             return;
         }
@@ -174,6 +176,25 @@ new #[Title('Wallet')] class extends Component
     public function refreshState(): void
     {
         unset($this->history, $this->balance);
+    }
+
+    /**
+     * User-facing error text. Chip domain exceptions carry curated
+     * messages; anything else is logged and replaced so responses never
+     * leak internals.
+     */
+    private function safeError(\Throwable $e): string
+    {
+        if ($e instanceof ChipTransferException || $e instanceof \InvalidArgumentException) {
+            return $e->getMessage();
+        }
+
+        Log::warning('Wallet operation failed unexpectedly.', [
+            'exception' => get_class($e),
+            'code' => $e->getCode(),
+        ]);
+
+        return __('Something went wrong. Please try again.');
     }
 
     public function counterpart(ChipTransaction $transaction): string

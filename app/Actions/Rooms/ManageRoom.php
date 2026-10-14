@@ -6,6 +6,7 @@ use App\Actions\Rooms\Exceptions\InvalidRoomStateException;
 use App\Actions\Rooms\Exceptions\NotMemberException;
 use App\Actions\Rooms\Exceptions\StackNotEmptyException;
 use App\Events\RoomStateUpdated;
+use App\Models\PokerHand;
 use App\Models\Room;
 use App\Models\RoomMember;
 use App\Models\User;
@@ -39,6 +40,8 @@ class ManageRoom
             'max_players' => ['required', 'integer', 'min:'.$activeCount, 'max:20'],
             'min_buy_in' => ['required', 'integer', 'min:1', 'max:1000000000'],
             'max_buy_in' => ['nullable', 'integer', 'min:1', 'max:1000000000', 'gte:min_buy_in'],
+            'action_timer' => ['sometimes', 'integer', 'min:0', 'max:3600'],
+            'action_timer_extension' => ['sometimes', 'integer', 'min:0', 'max:3600'],
         ])->validate();
 
         $room->fill($validated);
@@ -89,6 +92,17 @@ class ManageRoom
 
         $stranded = $room->stacks()->where('balance', '>', 0)->count();
 
+        $openHand = $room->pokerHands()
+            ->whereNotIn('status', [
+                PokerHand::STATUS_SETTLED,
+                PokerHand::STATUS_CANCELLED,
+            ])
+            ->exists();
+
+        if ($openHand) {
+            throw new InvalidRoomStateException('Finish or cancel the active hand before closing.');
+        }
+
         if ($stranded > 0) {
             throw new StackNotEmptyException('All table stacks must be cashed out before closing.');
         }
@@ -128,6 +142,15 @@ class ManageRoom
 
         if ($stackBalance > 0) {
             throw new StackNotEmptyException('The player must cash out before being removed.');
+        }
+
+        $inHand = PokerHand::where('room_id', $room->id)
+            ->whereNotIn('status', [PokerHand::STATUS_SETTLED, PokerHand::STATUS_CANCELLED])
+            ->whereHas('players', fn ($q) => $q->where('user_id', $player->id))
+            ->exists();
+
+        if ($inHand) {
+            throw new InvalidRoomStateException('A player in an active hand cannot be removed.');
         }
 
         $member->status = RoomMember::STATUS_REMOVED;

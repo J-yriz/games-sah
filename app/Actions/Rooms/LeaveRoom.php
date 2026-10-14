@@ -6,6 +6,8 @@ use App\Actions\Rooms\Exceptions\InvalidRoomStateException;
 use App\Actions\Rooms\Exceptions\NotMemberException;
 use App\Actions\Rooms\Exceptions\StackNotEmptyException;
 use App\Events\RoomStateUpdated;
+use App\Models\PokerHand;
+use App\Models\PokerHandPlayer;
 use App\Models\Room;
 use App\Models\RoomMember;
 use App\Models\User;
@@ -36,6 +38,10 @@ class LeaveRoom
             throw new StackNotEmptyException('Cash out your table stack before leaving.');
         }
 
+        if ($this->isSeatedInActiveHand($room->id, $user->id)) {
+            throw new InvalidRoomStateException('You cannot leave in the middle of a hand.');
+        }
+
         DB::transaction(function () use ($room, $member, $user): void {
             if ($member->isHost()) {
                 $others = $room->members()
@@ -56,5 +62,20 @@ class LeaveRoom
         });
 
         RoomStateUpdated::dispatch($room->id);
+    }
+
+    private function isSeatedInActiveHand(int $roomId, int $userId): bool
+    {
+        $activeHandIds = PokerHand::where('room_id', $roomId)
+            ->whereNotIn('status', [PokerHand::STATUS_SETTLED, PokerHand::STATUS_CANCELLED])
+            ->pluck('id');
+
+        if ($activeHandIds->isEmpty()) {
+            return false;
+        }
+
+        return PokerHandPlayer::whereIn('hand_id', $activeHandIds)
+            ->where('user_id', $userId)
+            ->exists();
     }
 }

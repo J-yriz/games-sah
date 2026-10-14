@@ -11,7 +11,8 @@ new class extends Component {
     public string $password = '';
 
     /**
-     * Delete the currently authenticated user.
+     * Close the account. Live value blocks closure; historical accounts
+     * are deactivated (history preserved), footprint-free accounts deleted.
      */
     public function deleteUser(Logout $logout): void
     {
@@ -19,7 +20,20 @@ new class extends Component {
             'password' => $this->currentPasswordRules(),
         ]);
 
-        tap(Auth::user(), $logout(...))->delete();
+        try {
+            $result = app(\App\Actions\CloseAccount::class)->handle(Auth::user());
+        } catch (\App\Actions\AccountBlockedException $e) {
+            $this->addError('password', $e->getMessage());
+
+            return;
+        }
+
+        $user = Auth::user();
+        $logout($user);
+
+        if ($result['mode'] === 'deleted') {
+            $user->delete();
+        }
 
         $this->redirect('/', navigate: true);
     }

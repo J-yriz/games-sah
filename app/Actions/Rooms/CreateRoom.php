@@ -30,10 +30,6 @@ class CreateRoom
             'game' => ['sometimes', 'string', 'in:poker'],
         ])->validate();
 
-        if (! $host->hasVerifiedEmail()) {
-            throw new InvalidRoomStateException('Only verified accounts can host rooms.');
-        }
-
         return DB::transaction(function () use ($host, $validated): Room {
             $room = Room::create([
                 'host_user_id' => $host->id,

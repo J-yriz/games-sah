@@ -2,24 +2,28 @@
 
 namespace App\Broadcasting;
 
-use App\Models\PokerHandPlayer;
+use App\Models\PokerHand;
+use App\Models\RoomMember;
 use App\Models\User;
 
 /**
  * Authorize poker hand channel subscriptions.
- * Only active participants in the hand may listen.
+ * Any active room member may watch the table (no hole cards are dealt
+ * digitally); hand participants are a subset of room members.
  */
 class PokerHandChannel
 {
     public function join(User $user, int $handId): bool
     {
-        return PokerHandPlayer::where('hand_id', $handId)
+        $hand = PokerHand::find($handId);
+
+        if ($hand === null) {
+            return false;
+        }
+
+        return RoomMember::where('room_id', $hand->room_id)
             ->where('user_id', $user->id)
-            ->whereIn('status', [
-                PokerHandPlayer::STATUS_ACTIVE,
-                PokerHandPlayer::STATUS_ALL_IN,
-                PokerHandPlayer::STATUS_FOLDED, // Folded players can still watch
-            ])
+            ->where('status', RoomMember::STATUS_ACTIVE)
             ->exists();
     }
 

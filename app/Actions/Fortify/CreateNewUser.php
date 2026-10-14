@@ -33,6 +33,7 @@ class CreateNewUser implements CreatesNewUsers
                 'username' => $input['username'],
                 'email' => $input['email'],
                 'password' => $input['password'],
+                'email_verified_at' => now(),
             ]);
 
             $wallet = Wallet::create([

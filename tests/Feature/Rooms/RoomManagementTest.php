@@ -52,13 +52,15 @@ test('invite codes are unique across rooms', function () {
     expect($codes->unique()->count())->toBe(10);
 });
 
-test('unverified users cannot host rooms', function () {
+test('users can host rooms without email verification', function () {
     $host = User::factory()->unverified()->create();
 
-    app(CreateRoom::class)->handle($host, [
+    $room = app(CreateRoom::class)->handle($host, [
         'name' => 'Friday Poker', 'max_players' => 4, 'min_buy_in' => 100,
     ]);
-})->throws(InvalidRoomStateException::class);
+
+    expect($room->host_user_id)->toBe($host->id);
+});
 
 test('join with a valid code adds an active player', function () {
     $host = User::factory()->create();

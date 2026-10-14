@@ -17,7 +17,7 @@ use Illuminate\Support\Carbon;
  * @property int $amount
  * @property int|null $raise_to
  * @property string $idempotency_key
- * @property array|null $metadata
+ * @property array<string, mixed>|null $metadata
  * @property Carbon|null $created_at
  * @property Carbon|null $updated_at
  */

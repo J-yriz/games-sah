@@ -22,6 +22,7 @@ use Illuminate\Support\Carbon;
  * @property int $big_blind
  * @property int $min_raise_multiplier
  * @property int $action_timer
+ * @property int $action_timer_extension
  * @property array<string, mixed>|null $settings
  * @property string $status
  * @property Carbon|null $created_at
@@ -56,6 +57,7 @@ class Room extends Model
         'big_blind',
         'min_raise_multiplier',
         'action_timer',
+        'action_timer_extension',
         'settings',
         'status',
     ];
@@ -73,6 +75,7 @@ class Room extends Model
             'big_blind' => 'integer',
             'min_raise_multiplier' => 'integer',
             'action_timer' => 'integer',
+            'action_timer_extension' => 'integer',
             'settings' => 'array',
         ];
     }

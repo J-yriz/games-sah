@@ -30,6 +30,22 @@ return [
 
     /*
     |--------------------------------------------------------------------------
+    | Trusted Proxies
+    |--------------------------------------------------------------------------
+    |
+    | IPs/CIDRs of reverse proxies (comma-separated TRUSTED_PROXIES) trusted
+    | for HTTPS detection, secure cookies, and client IPs. Empty by default:
+    | no proxy is trusted. Required behind any TLS-terminating proxy.
+    |
+    */
+
+    'trusted_proxies' => array_values(array_filter(array_map(
+        trim(...),
+        explode(',', (string) env('TRUSTED_PROXIES', ''))
+    ))),
+
+    /*
+    |--------------------------------------------------------------------------
     | Application Debug Mode
     |--------------------------------------------------------------------------
     |

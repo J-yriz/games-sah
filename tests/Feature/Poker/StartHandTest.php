@@ -154,11 +154,90 @@ test('small blind and big blind are posted and recorded in ledger', function () 
 
     expect($blinds)->toHaveCount(2);
 
-    $ledger = ChipTransaction::where('from_poker_hand_id', $hand->id)
+    $ledger = ChipTransaction::where('to_poker_hand_id', $hand->id)
         ->where('type', ChipTransaction::TYPE_BLIND_POST)
         ->get();
 
     expect($ledger)->toHaveCount(2);
+});
+
+test('blinds reduce table stacks atomically', function () {
+    $host = User::factory()->create();
+    $player1 = User::factory()->create();
+    $player2 = User::factory()->create();
+
+    $room = Room::factory()->create([
+        'host_user_id' => $host->id,
+        'status' => Room::STATUS_ACTIVE,
+        'small_blind' => 10,
+        'big_blind' => 20,
+    ]);
+
+    RoomMember::factory()->create(['room_id' => $room->id, 'user_id' => $host->id, 'role' => Room::ROLE_HOST, 'status' => RoomMember::STATUS_ACTIVE, 'seat' => 20]);
+    RoomMember::factory()->create(['room_id' => $room->id, 'user_id' => $player1->id, 'role' => Room::ROLE_PLAYER, 'status' => RoomMember::STATUS_ACTIVE, 'seat' => 21]);
+    RoomMember::factory()->create(['room_id' => $room->id, 'user_id' => $player2->id, 'role' => Room::ROLE_PLAYER, 'status' => RoomMember::STATUS_ACTIVE, 'seat' => 22]);
+    TableStack::factory()->create(['room_id' => $room->id, 'user_id' => $host->id, 'balance' => 1000]);
+    TableStack::factory()->create(['room_id' => $room->id, 'user_id' => $player1->id, 'balance' => 1000]);
+    TableStack::factory()->create(['room_id' => $room->id, 'user_id' => $player2->id, 'balance' => 1000]);
+
+    $hand = app(StartHand::class)->handle($host, $room, (string) Str::uuid());
+
+    // SB seat 21 posts 10, BB seat 22 posts 20; dealer untouched.
+    expect(TableStack::where('room_id', $room->id)->where('user_id', $player1->id)->value('balance'))->toBe(990)
+        ->and(TableStack::where('room_id', $room->id)->where('user_id', $player2->id)->value('balance'))->toBe(980)
+        ->and(TableStack::where('room_id', $room->id)->where('user_id', $host->id)->value('balance'))->toBe(1000)
+        ->and((int) TableStack::where('room_id', $room->id)->sum('balance'))->toBe(2970)
+        ->and($hand->total_pot)->toBe(30);
+});
+
+test('non-host cannot start a hand', function () {
+    $host = User::factory()->create();
+    $player1 = User::factory()->create();
+    $player2 = User::factory()->create();
+
+    $room = Room::factory()->create([
+        'host_user_id' => $host->id,
+        'status' => Room::STATUS_ACTIVE,
+        'small_blind' => 10,
+        'big_blind' => 20,
+    ]);
+
+    RoomMember::factory()->create(['room_id' => $room->id, 'user_id' => $host->id, 'role' => Room::ROLE_HOST, 'status' => RoomMember::STATUS_ACTIVE, 'seat' => 30]);
+    RoomMember::factory()->create(['room_id' => $room->id, 'user_id' => $player1->id, 'role' => Room::ROLE_PLAYER, 'status' => RoomMember::STATUS_ACTIVE, 'seat' => 31]);
+    RoomMember::factory()->create(['room_id' => $room->id, 'user_id' => $player2->id, 'role' => Room::ROLE_PLAYER, 'status' => RoomMember::STATUS_ACTIVE, 'seat' => 32]);
+    TableStack::factory()->create(['room_id' => $room->id, 'user_id' => $host->id, 'balance' => 1000]);
+    TableStack::factory()->create(['room_id' => $room->id, 'user_id' => $player1->id, 'balance' => 1000]);
+    TableStack::factory()->create(['room_id' => $room->id, 'user_id' => $player2->id, 'balance' => 1000]);
+
+    app(StartHand::class)->handle($player1, $room, (string) Str::uuid());
+})->throws(InvalidHandStateException::class);
+
+test('heads-up assigns dealer as small blind and dealer acts first', function () {
+    $host = User::factory()->create();
+    $player1 = User::factory()->create();
+
+    $room = Room::factory()->create([
+        'host_user_id' => $host->id,
+        'status' => Room::STATUS_ACTIVE,
+        'small_blind' => 10,
+        'big_blind' => 20,
+    ]);
+
+    RoomMember::factory()->create(['room_id' => $room->id, 'user_id' => $host->id, 'role' => Room::ROLE_HOST, 'status' => RoomMember::STATUS_ACTIVE, 'seat' => 40]);
+    RoomMember::factory()->create(['room_id' => $room->id, 'user_id' => $player1->id, 'role' => Room::ROLE_PLAYER, 'status' => RoomMember::STATUS_ACTIVE, 'seat' => 41]);
+    TableStack::factory()->create(['room_id' => $room->id, 'user_id' => $host->id, 'balance' => 1000]);
+    TableStack::factory()->create(['room_id' => $room->id, 'user_id' => $player1->id, 'balance' => 1000]);
+
+    $hand = app(StartHand::class)->handle($host, $room, (string) Str::uuid());
+
+    $dealer = $hand->players()->where('is_dealer', true)->first();
+    $sb = $hand->players()->where('is_small_blind', true)->first();
+    $bb = $hand->players()->where('is_big_blind', true)->first();
+
+    expect($dealer->user_id)->toBe($host->id)
+        ->and($sb->user_id)->toBe($host->id)
+        ->and($bb->user_id)->toBe($player1->id)
+        ->and($hand->current_turn_user_id)->toBe($host->id);
 });
 
 test('dealer button rotates', function () {

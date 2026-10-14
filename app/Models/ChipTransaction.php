@@ -53,6 +53,8 @@ class ChipTransaction extends Model
 
     public const TYPE_UNCALLED_RETURN = 'uncalled_return';
 
+    public const TYPE_REFUND = 'refund';
+
     /** @use HasFactory<ChipTransactionFactory> */
     use HasFactory;
 

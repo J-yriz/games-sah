@@ -43,10 +43,6 @@ class JoinRoom
             return $existing;
         }
 
-        if (! $user->hasVerifiedEmail()) {
-            throw new InvalidRoomStateException('Only verified accounts can join rooms.');
-        }
-
         if (! $room->isOpenForJoin()) {
             throw new InvalidRoomStateException('This room is no longer open for new players.');
         }

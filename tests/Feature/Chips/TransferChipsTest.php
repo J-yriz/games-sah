@@ -3,7 +3,6 @@
 use App\Actions\Chips\Exceptions\IdempotencyConflictException;
 use App\Actions\Chips\Exceptions\InsufficientBalanceException;
 use App\Actions\Chips\Exceptions\InvalidTransferAmountException;
-use App\Actions\Chips\Exceptions\RecipientIneligibleException;
 use App\Actions\Chips\Exceptions\RecipientNotFoundException;
 use App\Actions\Chips\Exceptions\SelfTransferException;
 use App\Actions\Chips\TransferChips;
@@ -125,13 +124,16 @@ test('transfer to an unknown username is rejected', function () {
     transferService()->handle($sender, 'ghost-user-xyz', 100, (string) Str::uuid());
 })->throws(RecipientNotFoundException::class);
 
-test('transfer to an unverified account is rejected', function () {
+test('transfer to an unverified account succeeds without verification', function () {
     $sender = User::factory()->create();
     $recipient = User::factory()->unverified()->create();
     fundWallet($sender, 10_000);
 
-    transferService()->handle($sender, $recipient->username, 100, (string) Str::uuid());
-})->throws(RecipientIneligibleException::class);
+    $result = transferService()->handle($sender, $recipient->username, 100, (string) Str::uuid());
+
+    expect($result->replayed)->toBeFalse()
+        ->and($sender->wallet->refresh()->balance)->toBe(9_900);
+});
 
 test('recipient lookup is case-insensitive', function () {
     $sender = User::factory()->create();

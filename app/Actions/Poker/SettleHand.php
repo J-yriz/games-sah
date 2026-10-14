@@ -2,53 +2,71 @@
 
 namespace App\Actions\Poker;
 
-use App\Actions\Poker\Exceptions\HandNotFoundException;
 use App\Actions\Poker\Exceptions\InvalidHandStateException;
 use App\Actions\Poker\Exceptions\InvalidSettlementException;
-use App\Actions\Poker\Exceptions\PlayerNotInHandException;
 use App\Events\PokerHandStateUpdated;
+use App\Events\RoomStateUpdated;
 use App\Models\ChipTransaction;
 use App\Models\PokerHand;
 use App\Models\PokerHandPlayer;
+use App\Models\Room;
+use App\Models\RoomMember;
+use App\Models\TableStack;
 use App\Models\User;
+use App\Support\PotCalculator;
 use Illuminate\Database\QueryException;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Collection;
 use Illuminate\Support\Facades\DB;
 
 /**
- * Handle showdown, pot calculation, and settlement.
+ * Settle a hand awaiting showdown: validate host-picked winners per pot,
+ * split pots with deterministic odd chips, return uncalled excess, and
+ * credit winners through the auditable ledger.
+ *
+ * Physical-cards assumption: the server never sees hole/community cards.
+ * The host reviews the physical table and submits winners; the backend
+ * only verifies eligibility and performs integer-exact accounting.
  */
 class SettleHand
 {
     /**
-     * @throws HandNotFoundException
+     * @param  array<int, array<int, int>>  $winners  pot_index => [user_id, ...]
+     * @return array<string, mixed>
+     *
      * @throws InvalidHandStateException
-     * @throws PlayerNotInHandException
      * @throws InvalidSettlementException
      */
     public function handle(
         User $host,
         PokerHand $hand,
-        array $winners, // [pot_index => [user_id, ...]]
+        array $winners,
         string $idempotencyKey,
     ): array {
         $this->validateIdempotencyKey($idempotencyKey);
 
-        $existing = PokerHand::where('idempotency_key', $idempotencyKey)->first();
-
-        if ($existing !== null) {
-            return $this->replay($existing);
+        // Idempotent replay on the settlement key (never touches the
+        // hand-start idempotency key).
+        $replayHand = PokerHand::where('settlement_key', $idempotencyKey)->first();
+        if ($replayHand !== null) {
+            return $this->replay($replayHand);
         }
 
-        if (! in_array($hand->status, [
-            PokerHand::STATUS_AWAITING_SHOWDOWN,
-            PokerHand::STATUS_SETTLED,
-        ], true)) {
+        if ($hand->status === PokerHand::STATUS_SETTLED) {
+            throw new InvalidHandStateException('Hand is already settled.');
+        }
+
+        if ($hand->status !== PokerHand::STATUS_AWAITING_SHOWDOWN) {
             throw new InvalidHandStateException('Hand is not ready for settlement.');
         }
 
-        // Only host can settle
-        $room = $hand->room;
-        if ($room->host_user_id !== $host->id) {
+        $isHost = RoomMember::where('room_id', $hand->room_id)
+            ->where('user_id', $host->id)
+            ->where('role', Room::ROLE_HOST)
+            ->where('status', RoomMember::STATUS_ACTIVE)
+            ->exists();
+
+        if (! $isHost) {
             throw new InvalidSettlementException('Only the room host can settle the hand.');
         }
 
@@ -56,288 +74,214 @@ class SettleHand
             $result = DB::transaction(function () use ($hand, $winners, $idempotencyKey): array {
                 $lockedHand = PokerHand::whereKey($hand->id)->lockForUpdate()->firstOrFail();
 
-                if (! in_array($lockedHand->status, [
-                    PokerHand::STATUS_AWAITING_SHOWDOWN,
-                    PokerHand::STATUS_SETTLED,
-                ], true)) {
+                if ($lockedHand->status === PokerHand::STATUS_SETTLED) {
+                    // A concurrent request with the same key may have settled
+                    // while this request waited on the hand lock.
+                    if ($lockedHand->settlement_key === $idempotencyKey) {
+                        return $this->replay($lockedHand);
+                    }
+
+                    throw new InvalidHandStateException('Hand is already settled.');
+                }
+
+                if ($lockedHand->status !== PokerHand::STATUS_AWAITING_SHOWDOWN) {
                     throw new InvalidHandStateException('Hand is not ready for settlement.');
                 }
 
-                // Load all hand players with stacks
-                $handPlayers = $lockedHand->players()
-                    ->whereIn('status', [PokerHandPlayer::STATUS_ACTIVE, PokerHandPlayer::STATUS_ALL_IN])
-                    ->with('stack')
+                $all = PokerHandPlayer::where('hand_id', $lockedHand->id)
+                    ->lockForUpdate()
+                    ->get();
+
+                if ($all->isEmpty()) {
+                    throw new InvalidSettlementException('No players in this hand.');
+                }
+
+                $inputs = $all->map(fn (PokerHandPlayer $p): array => [
+                    'user_id' => $p->user_id,
+                    'seat' => $p->seat,
+                    'total' => (int) $p->total_contribution,
+                    'folded' => $p->status === PokerHandPlayer::STATUS_FOLDED,
+                ])->toArray();
+
+                $calc = PotCalculator::calculate($inputs, (int) $lockedHand->dealer_seat);
+                $pots = $calc['pots'];
+
+                if ($pots === []) {
+                    throw new InvalidSettlementException('No pots to distribute.');
+                }
+
+                $this->validateWinners($pots, $winners, $all);
+
+                // Lock winner stacks in id order (deadlock-safe).
+                $winnerIds = collect($winners)->flatten()->unique()->sort()->values()->toArray();
+                $stacks = TableStack::where('room_id', $lockedHand->room_id)
+                    ->whereIn('user_id', $winnerIds)
+                    ->lockForUpdate()
+                    ->orderBy('id')
                     ->get()
                     ->keyBy('user_id');
 
-                if ($handPlayers->isEmpty()) {
-                    throw new InvalidSettlementException('No eligible players for settlement.');
-                }
-
-                // Calculate pot layers (main pot + side pots)
-                $potLayers = $this->calculatePotLayers($handPlayers);
-
-                // Validate winners against eligible players for each pot
-                $this->validateWinners($potLayers, $winners, $handPlayers);
-
-                // Distribute pots
                 $distributions = [];
-                foreach ($potLayers as $index => $layer) {
-                    $layerWinners = $winners[$index] ?? [];
-                    if (empty($layerWinners)) {
-                        continue;
+                foreach ($pots as $index => $pot) {
+                    $layerWinners = array_values(array_unique($winners[$index] ?? []));
+                    $shares = PotCalculator::splitPot(
+                        (int) $pot['amount'],
+                        $layerWinners,
+                        $inputs,
+                        (int) $lockedHand->dealer_seat
+                    );
+
+                    $layerDist = [];
+                    foreach ($shares as $winnerId => $share) {
+                        if ($share <= 0) {
+                            continue;
+                        }
+                        $stack = $stacks->get($winnerId);
+                        $handPlayer = $all->firstWhere('user_id', $winnerId);
+                        if ($stack === null || $handPlayer === null) {
+                            throw new InvalidSettlementException("Winner {$winnerId} has no table stack.");
+                        }
+
+                        $stack->balance += $share;
+                        $stack->save();
+
+                        ChipTransaction::create([
+                            'from_poker_hand_id' => $lockedHand->id,
+                            'to_table_stack_id' => $stack->id,
+                            'to_hand_player_id' => $handPlayer->id,
+                            'type' => ChipTransaction::TYPE_POT_WIN,
+                            'amount' => $share,
+                            'idempotency_key' => $idempotencyKey.':pot:'.$index.':winner:'.$winnerId,
+                            'metadata' => [
+                                'hand_id' => $lockedHand->id,
+                                'player_id' => $handPlayer->id,
+                                'pot_layer' => $index,
+                            ],
+                        ]);
+
+                        $layerDist[] = [
+                            'user_id' => $winnerId,
+                            'amount' => $share,
+                            'stack_after' => (int) $stack->balance,
+                        ];
                     }
 
-                    $distribution = $this->distributePot(
-                        $lockedHand,
-                        $layer,
-                        $layerWinners,
-                        $handPlayers,
-                        $idempotencyKey.':pot:'.$index,
-                    );
-                    $distributions[] = $distribution;
+                    // Integrity: layer payout must equal layer amount.
+                    $paid = array_sum(array_column($layerDist, 'amount'));
+                    if ($paid !== (int) $pot['amount']) {
+                        throw new InvalidSettlementException("Pot layer {$index} payout mismatch.");
+                    }
+
+                    $distributions[] = [
+                        'pot_amount' => (int) $pot['amount'],
+                        'eligible' => $pot['eligible'],
+                        'winners' => $layerDist,
+                    ];
                 }
 
-                // Handle uncalled bet returns
-                $uncalledReturns = $this->returnUncalledExcess($lockedHand, $handPlayers, $idempotencyKey.':uncalled');
+                $uncalledReturns = [];
+                if ($calc['uncalled'] !== null) {
+                    $uncalled = $calc['uncalled'];
+                    $handPlayer = $all->firstWhere('user_id', $uncalled['user_id']);
+                    $stack = $stacks->get($uncalled['user_id']);
 
-                // Update hand status
+                    // Uncalled excess may belong to a non-winner (e.g. lone
+                    // aggressor who then lost the lower pots). Lock separately.
+                    if ($stack === null) {
+                        $stack = TableStack::where('room_id', $lockedHand->room_id)
+                            ->where('user_id', $uncalled['user_id'])
+                            ->lockForUpdate()
+                            ->first();
+                    }
+
+                    if ($stack !== null && $handPlayer !== null && (int) $uncalled['amount'] > 0) {
+                        $stack->balance += (int) $uncalled['amount'];
+                        $stack->save();
+
+                        ChipTransaction::create([
+                            'from_poker_hand_id' => $lockedHand->id,
+                            'to_table_stack_id' => $stack->id,
+                            'to_hand_player_id' => $handPlayer->id,
+                            'type' => ChipTransaction::TYPE_UNCALLED_RETURN,
+                            'amount' => (int) $uncalled['amount'],
+                            'idempotency_key' => $idempotencyKey.':uncalled:'.$uncalled['user_id'],
+                            'metadata' => [
+                                'hand_id' => $lockedHand->id,
+                                'player_id' => $handPlayer->id,
+                            ],
+                        ]);
+
+                        $uncalledReturns[] = [
+                            'user_id' => $uncalled['user_id'],
+                            'amount' => (int) $uncalled['amount'],
+                            'stack_after' => (int) $stack->balance,
+                        ];
+                    }
+                }
+
                 $lockedHand->status = PokerHand::STATUS_SETTLED;
-                $lockedHand->completed_at = now();
-                $lockedHand->pot_layers = $potLayers;
-                $lockedHand->idempotency_key = $idempotencyKey;
+                $lockedHand->completed_at = Carbon::now();
+                $lockedHand->pot_layers = $pots;
+                $lockedHand->settlement_key = $idempotencyKey;
                 $lockedHand->save();
 
-                PokerHandStateUpdated::dispatch($lockedHand->id);
-
                 return [
-                    'hand' => $lockedHand,
-                    'pot_layers' => $potLayers,
+                    'hand' => $lockedHand->refresh(),
+                    'pot_layers' => $pots,
                     'distributions' => $distributions,
                     'uncalled_returns' => $uncalledReturns,
                 ];
             });
         } catch (QueryException $e) {
             if ($this->isUniqueViolation($e)) {
-                $existing = PokerHand::where('idempotency_key', $idempotencyKey)->first();
-                if ($existing !== null) {
-                    return $this->replay($existing);
+                $replayHand = PokerHand::where('settlement_key', $idempotencyKey)->first();
+                if ($replayHand !== null) {
+                    return $this->replay($replayHand);
                 }
             }
+
             throw $e;
         }
+
+        PokerHandStateUpdated::dispatch($hand->id, 'settled');
+        RoomStateUpdated::dispatch($hand->room_id);
+
+        return $result;
     }
 
     /**
-     * Calculate pot layers from player contributions.
-     * Returns array of layers: [amount, eligible_user_ids]
+     * @param  array<int, array{amount: int, eligible: array<int, int>}>  $pots
+     * @param  array<int, array<int, int>>  $winners
+     * @param  Collection<int, PokerHandPlayer>  $all
+     *
+     * @throws InvalidSettlementException
      */
-    private function calculatePotLayers(array $handPlayers): array
+    private function validateWinners(array $pots, array $winners, $all): void
     {
-        // Sort players by total_contribution ascending
-        $sorted = $handPlayers->sortBy('total_contribution')->values();
-        $layers = [];
+        $byUser = $all->keyBy('user_id');
 
-        $previousContribution = 0;
-        $eligibleCount = $sorted->count();
-
-        foreach ($sorted as $index => $player) {
-            $contribution = $player->total_contribution;
-
-            if ($contribution > $previousContribution) {
-                $delta = $contribution - $previousContribution;
-                $potAmount = $delta * $eligibleCount;
-
-                if ($potAmount > 0) {
-                    $eligibleIds = $sorted->slice($index)->pluck('user_id')->toArray();
-                    $layers[] = [
-                        'amount' => $potAmount,
-                        'eligible' => $eligibleIds,
-                    ];
-                }
-
-                $previousContribution = $contribution;
-            }
-
-            $eligibleCount--;
-        }
-
-        return $layers;
-    }
-
-    /**
-     * Validate that winners are eligible for their pots.
-     */
-    private function validateWinners(array $potLayers, array $winners, array $handPlayers): void
-    {
-        foreach ($potLayers as $index => $layer) {
+        foreach ($pots as $index => $pot) {
             $layerWinners = $winners[$index] ?? [];
 
-            if (empty($layerWinners)) {
-                throw new InvalidSettlementException(
-                    "No winners specified for pot layer {$index}."
-                );
+            if ($layerWinners === []) {
+                throw new InvalidSettlementException("No winners specified for pot layer {$index}.");
             }
 
-            foreach ($layerWinners as $winnerId) {
-                if (! in_array($winnerId, $layer['eligible'], true)) {
-                    throw new InvalidSettlementException(
-                        "Winner {$winnerId} is not eligible for pot layer {$index}."
-                    );
+            foreach (array_unique($layerWinners) as $winnerId) {
+                if (! in_array($winnerId, $pot['eligible'], true)) {
+                    throw new InvalidSettlementException("Winner {$winnerId} is not eligible for pot layer {$index}.");
                 }
 
-                $player = $handPlayers->get($winnerId);
-                if ($player === null || $player->status === PokerHandPlayer::STATUS_FOLDED) {
-                    throw new InvalidSettlementException(
-                        "Winner {$winnerId} is folded or not in hand."
-                    );
+                $player = $byUser->get($winnerId);
+                if ($player === null) {
+                    throw new InvalidSettlementException("Winner {$winnerId} is not in this hand.");
+                }
+
+                if ($player->status === PokerHandPlayer::STATUS_FOLDED) {
+                    throw new InvalidSettlementException("Winner {$winnerId} has folded.");
                 }
             }
         }
-    }
-
-    /**
-     * Distribute a single pot layer among winners.
-     */
-    private function distributePot(
-        PokerHand $hand,
-        array $layer,
-        array $winnerIds,
-        array $handPlayers,
-        string $idempotencyKey,
-    ): array {
-        $potAmount = $layer['amount'];
-        $winnerCount = count($winnerIds);
-        $baseShare = intdiv($potAmount, $winnerCount);
-        $remainder = $potAmount % $winnerCount;
-
-        // Determine odd chip recipient: first winner in seat order from dealer
-        $oddChipWinner = $this->determineOddChipWinner($winnerIds, $hand);
-
-        $distribution = [];
-
-        foreach ($winnerIds as $index => $winnerId) {
-            $player = $handPlayers->get($winnerId);
-            if ($player === null || $player->stack === null) {
-                continue;
-            }
-
-            $share = $baseShare + ($winnerId === $oddChipWinner && $remainder > 0 ? 1 : 0);
-
-            if ($share > 0) {
-                $stack = $player->stack;
-                $stack->balance += $share;
-                $stack->save();
-
-                // Ledger: hand (escrow) -> stack
-                ChipTransaction::create([
-                    'from_poker_hand_id' => $hand->id,
-                    'to_table_stack_id' => $stack->id,
-                    'to_hand_player_id' => $player->id,
-                    'type' => ChipTransaction::TYPE_POT_WIN,
-                    'amount' => $share,
-                    'idempotency_key' => $idempotencyKey.':winner:'.$winnerId,
-                    'metadata' => [
-                        'hand_id' => $hand->id,
-                        'player_id' => $player->id,
-                        'pot_layer' => $index,
-                        'username' => $player->user->username,
-                    ],
-                ]);
-
-                $distribution[] = [
-                    'user_id' => $winnerId,
-                    'amount' => $share,
-                    'stack_after' => $stack->balance,
-                ];
-            }
-        }
-
-        return [
-            'pot_amount' => $potAmount,
-            'winners' => $distribution,
-        ];
-    }
-
-    /**
-     * Return uncalled bet excess to the player who made the bet that wasn't fully called.
-     */
-    private function returnUncalledExcess(PokerHand $hand, array $handPlayers, string $idempotencyKey): array
-    {
-        $returns = [];
-
-        // Find players who bet/raised more than anyone else called
-        // This is handled by pot layer calculation - the last layer only includes the aggressor
-        // The uncalled portion is already not included in any pot layer
-        // But we need to return the excess to the aggressor
-
-        $maxContribution = $handPlayers->max('total_contribution');
-        $aggressors = $handPlayers->filter(fn ($p) => $p->total_contribution === $maxContribution);
-
-        // If there's only one aggressor and their contribution exceeds the next highest,
-        // return the difference
-        if ($aggressors->count() === 1) {
-            $aggressor = $aggressors->first();
-            $secondMax = $handPlayers->filter(fn ($p) => $p->user_id !== $aggressor->user_id)
-                ->max('total_contribution') ?? 0;
-
-            $excess = $maxContribution - $secondMax;
-            if ($excess > 0 && $aggressor->stack !== null) {
-                $stack = $aggressor->stack;
-                $stack->balance += $excess;
-                $stack->save();
-
-                ChipTransaction::create([
-                    'from_poker_hand_id' => $hand->id,
-                    'to_table_stack_id' => $stack->id,
-                    'to_hand_player_id' => $aggressor->id,
-                    'type' => ChipTransaction::TYPE_UNCALLED_RETURN,
-                    'amount' => $excess,
-                    'idempotency_key' => $idempotencyKey.':excess:'.$aggressor->user_id,
-                    'metadata' => [
-                        'hand_id' => $hand->id,
-                        'player_id' => $aggressor->id,
-                        'username' => $aggressor->user->username,
-                    ],
-                ]);
-
-                $returns[] = [
-                    'user_id' => $aggressor->user_id,
-                    'amount' => $excess,
-                    'stack_after' => $stack->balance,
-                ];
-            }
-        }
-
-        return $returns;
-    }
-
-    /**
-     * Determine odd chip winner using seat order from dealer.
-     */
-    private function determineOddChipWinner(array $winnerIds, PokerHand $hand): ?int
-    {
-        $winnerPlayers = $hand->players()
-            ->whereIn('user_id', $winnerIds)
-            ->whereIn('status', [PokerHandPlayer::STATUS_ACTIVE, PokerHandPlayer::STATUS_ALL_IN])
-            ->orderBy('seat')
-            ->get();
-
-        if ($winnerPlayers->isEmpty()) {
-            return null;
-        }
-
-        $dealerSeat = $hand->dealer_seat;
-
-        // Find first winner seat after dealer
-        foreach ($winnerPlayers as $player) {
-            if ($player->seat > $dealerSeat) {
-                return $player->user_id;
-            }
-        }
-
-        // Wrap around
-        return $winnerPlayers->first()->user_id;
     }
 
     private function validateIdempotencyKey(string $idempotencyKey): void
@@ -347,6 +291,9 @@ class SettleHand
         }
     }
 
+    /**
+     * @return array{hand: PokerHand, pot_layers: mixed, distributions: array<int, mixed>, uncalled_returns: array<int, mixed>, replayed: bool}
+     */
     private function replay(PokerHand $existing): array
     {
         return [
@@ -358,16 +305,10 @@ class SettleHand
         ];
     }
 
-    private function validateIdempotencyKey(string $idempotencyKey): void
-    {
-        if ($idempotencyKey === '' || mb_strlen($idempotencyKey) > 64) {
-            throw new \InvalidArgumentException('A valid operation ID is required.');
-        }
-    }
-
     private function isUniqueViolation(QueryException $e): bool
     {
         return str_contains($e->getMessage(), 'idempotency_key')
+            || str_contains($e->getMessage(), 'settlement_key')
             || in_array($e->getCode(), ['23000', '23505'], true);
     }
 }

@@ -1,5 +1,7 @@
 <?php
 
+use App\Actions\Poker\AdvanceStreet;
+use App\Actions\Poker\PlayerAction;
 use App\Actions\Poker\StartHand;
 use App\Models\PokerHand;
 use App\Models\Room;
@@ -80,4 +82,75 @@ function startPokerHand(User $host, array $players): PokerHand
     }
 
     return app(StartHand::class)->handle($host, $room, (string) Str::uuid());
+}
+
+/**
+ * Complete preflop with no raises (3-handed default seating):
+ * UTG calls, SB completes, BB checks. Ends in awaiting_flop.
+ */
+function completePreflopNoRaise(PokerHand $hand, User $utg, User $sb, User $bb): PokerHand
+{
+    app(PlayerAction::class)->handle($utg, $hand, 'call', (string) Str::uuid());
+    app(PlayerAction::class)->handle($sb, $hand, 'call', (string) Str::uuid());
+    app(PlayerAction::class)->handle($bb, $hand, 'check', (string) Str::uuid());
+
+    return $hand->refresh();
+}
+
+/**
+ * Host opens the next street, then every active player checks.
+ * Assumes all active players can check (no bets yet on the street).
+ */
+function checkStreet(PokerHand $hand, User $host, array $playersInTurnOrder): PokerHand
+{
+    $hand = app(AdvanceStreet::class)->handle($host, $hand);
+
+    // Check whoever's turn it is, up to 10 actions (covers reordering after
+    // folds). Only players in $playersInTurnOrder are allowed to act.
+    $allowed = array_map(fn ($u) => $u->id, $playersInTurnOrder);
+
+    for ($i = 0; $i < 10; $i++) {
+        $fresh = $hand->refresh();
+        if (! in_array($fresh->status, [
+            PokerHand::STATUS_FLOP,
+            PokerHand::STATUS_TURN,
+            PokerHand::STATUS_RIVER,
+            PokerHand::STATUS_PREFLOP,
+        ], true)) {
+            break;
+        }
+        $turnId = $fresh->current_turn_user_id;
+        if ($turnId === null || ! in_array($turnId, $allowed, true)) {
+            break;
+        }
+        $player = null;
+        foreach ($playersInTurnOrder as $candidate) {
+            if ($candidate->id === $turnId) {
+                $player = $candidate;
+                break;
+            }
+        }
+        if ($player === null) {
+            break;
+        }
+        app(PlayerAction::class)->handle($player, $fresh, 'check', (string) Str::uuid());
+        $hand = $fresh->refresh();
+    }
+
+    return $hand->refresh();
+}
+
+/**
+ * Drive a 3-handed hand (host=dealer seat 0, p1 seat 1, p2 seat 2) from
+ * preflop to awaiting_showdown with no raises.
+ */
+function driveToShowdown(PokerHand $hand, User $host, User $p1, User $p2): PokerHand
+{
+    completePreflopNoRaise($hand, $host, $p1, $p2);
+    // Flop/turn/river first-to-act order: p1, p2, host.
+    $hand = checkStreet($hand, $host, [$p1, $p2, $host]);
+    $hand = checkStreet($hand, $host, [$p1, $p2, $host]);
+    $hand = checkStreet($hand, $host, [$p1, $p2, $host]);
+
+    return $hand->refresh();
 }

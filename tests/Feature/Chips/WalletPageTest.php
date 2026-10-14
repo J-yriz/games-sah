@@ -26,10 +26,10 @@ test('guests cannot open the wallet page', function () {
     $this->get(route('wallet'))->assertRedirect(route('login'));
 });
 
-test('unverified users cannot open the wallet page', function () {
+test('users can open the wallet page without email verification', function () {
     $user = User::factory()->unverified()->create();
 
-    $this->actingAs($user)->get(route('wallet'))->assertRedirect(route('verification.notice'));
+    $this->actingAs($user)->get(route('wallet'))->assertOk();
 });
 
 test('wallet page shows the current balance', function () {
